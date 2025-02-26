@@ -2,7 +2,16 @@
 
 ## 目录
 
-- [第3章：内存地址空间](Linux内核内存管理机制-第3章-内存地址空间.md)
+- [第2章：内存初始化与基本分配](Linux内核内存管理机制-第2章-内存初始化与基本分配.md)
+  - ARM64架构启动阶段内存管理
+  - 物理内存分配
+  - 内存初始化流程
+  - 基本分配器实现
+- [第3章：内存地址空间与TLB管理](Linux内核内存管理机制-第3章-内存地址空间.md)
+  - 内核空间与用户空间
+  - 虚拟内存区域(VMA)
+  - TLB管理与优化
+  - 反向映射
 - [第4章：内存分配算法](Linux内核内存管理机制-第4章-内存分配算法.md)
 - [第5章：页面置换算法](Linux内核内存管理机制-第5章-页面置换算法.md)
 - [第6章：内存管理性能调优](Linux内核内存管理机制-第6章-内存管理性能调优.md)
@@ -451,11 +460,9 @@ Linux内核中的页表实现具有以下特点：
 - 支持多种页大小：4KB、2MB、1GB（大页）
 - 通过页表实现虚拟页到物理页的映射
 
-### 1.3 内存分配和回收原理
+### 1.3 内存管理概述
 
-#### 1.3.1 分配机制详解
-
-物理内存管理的层次结构：
+#### 1.3.1 内存管理层次结构
 
 ```
 用户空间应用程序
@@ -473,44 +480,7 @@ Linux内核中的页表实现具有以下特点：
 物理内存硬件
 ```
 
-GFP标志控制分配的行为：
-
-1. **可重试性**：
-   - `__GFP_NORETRY`：不重试，快速失败
-   - `__GFP_RETRY_MAYFAIL`：尝试几次但可能失败
-
-2. **页面回收**：
-   - `__GFP_DIRECT_RECLAIM`：允许直接回收
-   - `__GFP_KSWAPD_RECLAIM`：触发kswapd后台回收
-
-3. **I/O操作**：
-   - `__GFP_IO`：允许启动I/O操作
-   - `__GFP_FS`：允许文件系统操作
-
-常用的GFP组合标志：
-
-```c
-/* include/linux/gfp.h */
-#define GFP_KERNEL     (__GFP_RECLAIM | __GFP_IO | __GFP_FS)
-#define GFP_ATOMIC     (__GFP_HIGH)
-#define GFP_USER       (__GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_HARDWALL)
-#define GFP_HIGHUSER   (GFP_USER | __GFP_HIGHMEM)
-#define GFP_NOWAIT     (__GFP_KSWAPD_RECLAIM)
-```
-
-内存分配的主要路径：
-
-```c
-/* mm/page_alloc.c */
-struct page *alloc_pages(gfp_t gfp_mask, unsigned int order)
-{
-    /* 调用底层分配函数，带内存区域选择逻辑 */
-    return alloc_pages_current(gfp_mask, order);
-}
-
-void *kmalloc(size_t size, gfp_t flags)
-{
-    /* 通过SLAB/SLUB分配器申请小对象 */
+具体的内存分配和回收机制将在第2章和第4章详细介绍。
     return __kmalloc(size, flags);
 }
 ```

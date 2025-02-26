@@ -54,6 +54,86 @@ enum migratetype {
     MIGRATE_HIGHATOMIC,  /* 高阶原子分配 */
     MIGRATE_TYPES        /* 迁移类型总数 */
 };
+
+### 4.2 每CPU页面分配器（PCP）
+
+#### 4.2.1 基本原理
+
+每CPU页面分配器（Per-CPU Page Allocator）是一个优化机制，用于提高单页面分配的性能：
+
+- 每个CPU维护一个本地页面缓存
+- 避免了频繁访问全局页面列表
+- 减少了自旋锁竞争
+- 提高了缓存命中率
+
+#### 4.2.2 数据结构
+
+```c
+struct per_cpu_pages {
+    int count;      /* 当前页面数量 */
+    int high;       /* 高水位线 */
+    int batch;      /* 批量操作大小 */
+    struct list_head lists[MIGRATE_PCPTYPES]; /* 页面列表 */
+};
+
+struct per_cpu_pageset {
+    struct per_cpu_pages pcp;    /* 热页面列表 */
+    /* 其他统计信息... */
+};
+```
+
+#### 4.2.3 工作流程
+
+1. **分配过程**：
+   ```c
+   static struct page *buffered_rmqueue(struct zone *zone, int order,
+                                       gfp_t gfp_flags)
+   {
+       struct per_cpu_pages *pcp;
+       struct page *page;
+       
+       /* 对于单页请求，优先从PCP获取 */
+       if (likely(order == 0)) {
+           pcp = &this_cpu_ptr(zone->pageset)->pcp;
+           if (pcp->count) {
+               page = list_first_entry(&pcp->lists[migratetype],
+                                      struct page, lru);
+               list_del(&page->lru);
+               pcp->count--;
+               return page;
+           }
+       }
+       
+       /* PCP为空或请求多页，回退到伙伴系统 */
+       return __rmqueue(zone, order, migratetype);
+   }
+   ```
+
+2. **补充机制**：
+   - 当PCP中的页面数量低于阈值时
+   - 从伙伴系统批量获取页面
+   - 减少访问全局分配器的频率
+
+3. **释放过程**：
+   ```c
+   void free_hot_cold_page(struct page *page, bool cold)
+   {
+       struct zone *zone = page_zone(page);
+       struct per_cpu_pages *pcp;
+       
+       if (likely(!cold)) {
+           pcp = &this_cpu_ptr(zone->pageset)->pcp;
+           if (pcp->count < pcp->high) {
+               list_add(&page->lru, &pcp->lists[migratetype]);
+               pcp->count++;
+               return;
+           }
+       }
+       
+       /* PCP已满或冷页面，直接返回伙伴系统 */
+       __free_one_page(page, pfn, zone, 0, migratetype);
+   }
+   ```
 ```
 
 #### 4.1.3 分配算法
