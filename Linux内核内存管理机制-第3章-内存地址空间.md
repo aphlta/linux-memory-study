@@ -98,6 +98,92 @@ TLB（Translation Lookaside Buffer）是一个硬件缓存，用于加速虚拟�
 
 #### 3.3.2 TLB优化策略
 
+1. **TLB预取技术**
+   - 基于空间局部性的预取：预取相邻页表项
+   - 基于访问模式的预测：分析内存访问模式预取TLB
+   - 软件引导预取：编译器插入TLB预取指令
+   - 硬件实现：ARM v8.2 TTLBOS (Translation Table Level Based Prefetch) 机制
+   - 性能影响：可减少15-25%的TLB miss率
+
+2. **TLB能耗优化**
+   - 选择性TLB失效：只刷新必要的TLB条目
+   - 自适应TLB大小：根据工作负载动态调整TLB大小
+   - 智能TLB电源管理：低功耗状态下部分TLB逻辑断电
+   - ASID分配优化：减少全局TLB刷新频率
+
+3. **TLB监控与分析**
+   ```bash
+   # 监控TLB miss事件
+   perf stat -e dTLB-load-misses,dTLB-store-misses ./your_application
+
+   # 查看当前TLB状态
+   cat /proc/pagetypeinfo
+   cat /proc/vmstat | grep tlb
+   ```
+
+### 3.4 内存屏障与一致性
+
+#### 3.4.1 内存屏障基础
+
+内存屏障是确保多处理器系统中内存操作顺序的低级同步原语。它们解决了以下问题：
+
+- 编译器重排序：编译器优化可能改变指令顺序
+- CPU重排序：处理器可能乱序执行内存访问
+- 缓存一致性：多核系统中的缓存同步延迟
+
+#### 3.4.2 Linux内存屏障API
+
+Linux内核提供了一组内存屏障原语：
+
+```c
+/* 通用内存屏障 */
+void mb(void);      /* 完全内存屏障 */
+void rmb(void);     /* 读内存屏障 */
+void wmb(void);     /* 写内存屏障 */
+
+/* 带获取/释放语义的屏障 */
+void smp_mb(void);  /* SMP完全内存屏障 */
+void smp_rmb(void); /* SMP读内存屏障 */
+void smp_wmb(void); /* SMP写内存屏障 */
+
+/* 编译器屏障 */
+void barrier(void); /* 防止编译器重排序 */
+```
+
+#### 3.4.3 内存屏障使用场景
+
+内存屏障在以下场景中至关重要：
+
+1. **锁实现**：
+   ```c
+   /* 自旋锁实现示例 */
+   void spin_lock(spinlock_t *lock)
+   {
+       /* 尝试获取锁 */
+       while (test_and_set_bit_lock(0, &lock->slock)) {
+           /* 等待 */
+       }
+
+       /* 获取锁后的内存屏障 */
+       smp_mb__after_spinlock();
+   }
+   ```
+
+2. **无锁数据结构**：
+   ```c
+   /* 无锁队列示例 */
+   void queue_push(struct queue *q, struct node *n)
+   {
+       n->next = NULL;
+       struct node *prev = xchg(&q->tail, n);
+
+       /* 确保节点完全初始化后再链接 */
+       smp_wmb();
+
+       prev->next = n;
+   }
+   ```
+
 1. **批量TLB Flush**
    - 收集多个TLB失效请求，一次性处理
    - 减少TLB刷新频率
@@ -154,42 +240,237 @@ TLB Shootdown是多处理器系统中维护TLB一致性的关键机制。当一�
 
 1. **MMU Notifier机制**
    ```c
-   static void __mmu_notifier_invalidate_range_start(struct mm_struct *mm,
-           unsigned long start, unsigned long end)
-   {
-       // 通知所有注册的侦听器页表变化
-       struct mmu_notifier *mn;
+    /*
+     * 处理MMU通知器范围失效的起始阶段
+     * @subscriptions: MMU通知器订阅列表
+     * @range: 需要失效的地址范围信息
+     * 
+     * 该函数遍历所有注册的MMU通知器，调用它们的invalidate_range_start回调函数
+     * 主要用于通知各个子系统（如设备驱动、虚拟化层）页表即将发生变化
+     */
+    static int mn_hlist_invalidate_range_start(
+        struct mmu_notifier_subscriptions *subscriptions,
+        struct mmu_notifier_range *range)
+    {
+        struct mmu_notifier *subscription;
+        int ret = 0;
+        int id;
 
-       hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist)
-           if (mn->ops->invalidate_range_start)
-               mn->ops->invalidate_range_start(mn, mm, start, end);
-   }
+        /* 获取SRCU读锁，保护遍历过程中的并发安全 */
+        id = srcu_read_lock(&srcu);
+        /* 使用RCU安全地遍历所有注册的通知器 */
+        hlist_for_each_entry_rcu(subscription, &subscriptions->list, hlist,
+                    srcu_read_lock_held(&srcu)) {
+            const struct mmu_notifier_ops *ops = subscription->ops;
+
+            if (ops->invalidate_range_start) {
+                int _ret;
+
+                /* 处理非阻塞模式的特殊情况 */
+                if (!mmu_notifier_range_blockable(range))
+                    non_block_start();
+                /* 调用通知器的回调函数 */
+                _ret = ops->invalidate_range_start(subscription, range);
+                if (!mmu_notifier_range_blockable(range))
+                    non_block_end();
+                if (_ret) {
+                    /* 处理回调函数执行失败的情况 */
+                    pr_info("%pS callback failed with %d in %sblockable context.\n",
+                        ops->invalidate_range_start, _ret,
+                        !mmu_notifier_range_blockable(range) ?
+                            "non-" :
+                            "");
+                    /* 在阻塞上下文中，只允许-EAGAIN错误 */
+                    WARN_ON(mmu_notifier_range_blockable(range) ||
+                        _ret != -EAGAIN);
+                    /*
+                     * 对于EAGAIN错误，我们仍然会调用所有的通知器
+                     * 因为通知器无法知道其start方法是否失败
+                     * 所以执行EAGAIN的start不能同时执行end
+                     */
+                    WARN_ON(ops->invalidate_range_end);
+                    ret = _ret;
+                }
+            }
+        }
+
+        /* 处理失败情况下的清理工作 */
+        if (ret) {
+            /*
+             * 到达这里必须是非阻塞模式
+             * 如果有多个通知器且其中一个或多个start失败
+             * 对于那些start成功的通知器，需要调用它们的end方法
+             */
+            hlist_for_each_entry_rcu(subscription, &subscriptions->list,
+                        hlist, srcu_read_lock_held(&srcu)) {
+                if (!subscription->ops->invalidate_range_end)
+                    continue;
+
+                subscription->ops->invalidate_range_end(subscription,
+                                    range);
+            }
+        }
+        /* 释放SRCU读锁 */
+        srcu_read_unlock(&srcu, id);
+
+        return ret;
+    }
+
+    /*
+     * MMU通知器范围失效的主入口函数
+     * @range: 需要失效的地址范围信息
+     *
+     * 该函数首先处理区间树通知器，然后处理哈希链表中的通知器
+     */
+    int __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *range)
+    {
+        struct mmu_notifier_subscriptions *subscriptions =
+            range->mm->notifier_subscriptions;
+        int ret;
+
+        /* 首先处理区间树通知器 */
+        if (subscriptions->has_itree) {
+            ret = mn_itree_invalidate(subscriptions, range);
+            if (ret)
+                return ret;
+        }
+        /* 然后处理哈希链表中的通知器 */
+        if (!hlist_empty(&subscriptions->list))
+            return mn_hlist_invalidate_range_start(subscriptions, range);
+        return 0;
+    }
+
+    /*
+     * 处理MMU通知器范围失效的结束阶段
+     * @subscriptions: MMU通知器订阅列表
+     * @range: 需要失效的地址范围信息
+     *
+     * 该函数遍历所有注册的MMU通知器，调用它们的invalidate_range_end回调函数
+     */
+    static void
+    mn_hlist_invalidate_end(struct mmu_notifier_subscriptions *subscriptions,
+                struct mmu_notifier_range *range)
+    {
+        struct mmu_notifier *subscription;
+        int id;
+
+        /* 获取SRCU读锁 */
+        id = srcu_read_lock(&srcu);
+        /* 遍历所有注册的通知器 */
+        hlist_for_each_entry_rcu(subscription, &subscriptions->list, hlist,
+                    srcu_read_lock_held(&srcu)) {
+            if (subscription->ops->invalidate_range_end) {
+                /* 处理非阻塞模式 */
+                if (!mmu_notifier_range_blockable(range))
+                    non_block_start();
+                /* 调用通知器的end回调函数 */
+                subscription->ops->invalidate_range_end(subscription,
+                                    range);
+                if (!mmu_notifier_range_blockable(range))
+                    non_block_end();
+            }
+        }
+        /* 释放SRCU读锁 */
+        srcu_read_unlock(&srcu, id);
+    }
+
+    /*
+     * MMU通知器范围失效结束的主入口函数
+     * @range: 需要失效的地址范围信息
+     *
+     * 该函数完成整个范围失效过程，包括区间树和哈希链表中的通知器
+     */
+    void __mmu_notifier_invalidate_range_end(struct mmu_notifier_range *range)
+    {
+        struct mmu_notifier_subscriptions *subscriptions =
+            range->mm->notifier_subscriptions;
+
+        /* 获取锁以确保与start操作的同步 */
+        lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
+        /* 处理区间树通知器的结束阶段 */
+        if (subscriptions->has_itree)
+            mn_itree_inv_end(subscriptions);
+
+        /* 处理哈希链表中通知器的结束阶段 */
+        if (!hlist_empty(&subscriptions->list))
+            mn_hlist_invalidate_end(subscriptions, range);
+        /* 释放锁 */
+        lock_map_release(&__mmu_notifier_invalidate_range_start_map);
+    }
+
+    /*
+     * 使二级TLB失效的架构特定函数
+     * @mm: 进程的内存描述符
+     * @start: 需要失效的起始地址
+     * @end: 需要失效的结束地址
+     *
+     * 该函数用于处理特定架构上的二级TLB失效操作
+     * 主要用于虚拟化环境中Guest OS的TLB管理
+     */
+    void __mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
+                        unsigned long start, unsigned long end)
+    {
+        struct mmu_notifier *subscription;
+        int id;
+
+        /* 获取SRCU读锁 */
+        id = srcu_read_lock(&srcu);
+        /* 遍历所有注册的通知器 */
+        hlist_for_each_entry_rcu(subscription,
+                    &mm->notifier_subscriptions->list, hlist,
+                    srcu_read_lock_held(&srcu)) {
+            /* 调用架构特定的二级TLB失效函数 */
+            if (subscription->ops->arch_invalidate_secondary_tlbs)
+                subscription->ops->arch_invalidate_secondary_tlbs(
+                    subscription, mm,
+                    start, end);
+        }
+        /* 释放SRCU读锁 */
+        srcu_read_unlock(&srcu, id);
+    }
    ```
 
 2. **IPI处理流程**
    ```c
+   /*
+    * 在多处理器系统中刷新其他CPU的TLB
+    * @cpumask: 需要执行TLB刷新的CPU掩码
+    * @mm: 需要刷新TLB的进程内存描述符
+    * @start: 需要刷新的虚拟地址范围起始地址
+    * @end: 需要刷新的虚拟地址范围结束地址
+    *
+    * 该函数通过处理器间中断(IPI)实现跨CPU的TLB同步
+    * 这是保持多CPU系统TLB一致性的关键机制
+    */
    static void native_flush_tlb_others(const struct cpumask *cpumask,
            struct mm_struct *mm, unsigned long start, unsigned long end)
    {
-       // 发送IPI到其他CPU
+       /* 准备TLB刷新信息 */
        struct tlb_flush_info info;
-       info.mm = mm;
-       info.start = start;
-       info.end = end;
+       info.mm = mm;      /* 要刷新的地址空间 */
+       info.start = start;  /* 刷新范围的起始地址 */
+       info.end = end;      /* 刷新范围的结束地址 */
        
-       // 在目标CPU上执行TLB flush
+       /* 通过IPI触发其他CPU执行TLB刷新
+        * 最后的参数1表示等待所有CPU完成刷新操作
+        */
        smp_call_function_many(cpumask, flush_tlb_func, &info, 1);
    }
    ```
 
 3. **延迟TLB Flush优化**
    ```c
+   /*
+    * TLB批处理结构体，用于优化TLB刷新操作
+    * 通过将多个TLB刷新请求合并处理，减少IPI中断次数
+    * 这对于大量小粒度的TLB刷新操作特别有效
+    */
    struct tlb_batch {
-       struct mm_struct *mm;
-       unsigned long start;
-       unsigned long end;
-       unsigned int nr;        // 批处理的页面数
-       bool flush_needed;      // 是否需要刷新
+       struct mm_struct *mm;    /* 地址空间描述符 */
+       unsigned long start;     /* 批处理范围的最小地址 */
+       unsigned long end;       /* 批处理范围的最大地址 */
+       unsigned int nr;        /* 当前批次中累积的页面数量 */
+       bool flush_needed;      /* 标记是否需要执行实际的刷新操作 */
    };
 
    // 批量处理TLB flush请求
@@ -445,6 +726,92 @@ TLB（Translation Lookaside Buffer）是一个硬件缓存，用于加速虚拟�
 
 #### 3.3.2 TLB优化策略
 
+1. **TLB预取技术**
+   - 基于空间局部性的预取：预取相邻页表项
+   - 基于访问模式的预测：分析内存访问模式预取TLB
+   - 软件引导预取：编译器插入TLB预取指令
+   - 硬件实现：ARM v8.2 TTLBOS (Translation Table Level Based Prefetch) 机制
+   - 性能影响：可减少15-25%的TLB miss率
+
+2. **TLB能耗优化**
+   - 选择性TLB失效：只刷新必要的TLB条目
+   - 自适应TLB大小：根据工作负载动态调整TLB大小
+   - 智能TLB电源管理：低功耗状态下部分TLB逻辑断电
+   - ASID分配优化：减少全局TLB刷新频率
+
+3. **TLB监控与分析**
+   ```bash
+   # 监控TLB miss事件
+   perf stat -e dTLB-load-misses,dTLB-store-misses ./your_application
+
+   # 查看当前TLB状态
+   cat /proc/pagetypeinfo
+   cat /proc/vmstat | grep tlb
+   ```
+
+### 3.4 内存屏障与一致性
+
+#### 3.4.1 内存屏障基础
+
+内存屏障是确保多处理器系统中内存操作顺序的低级同步原语。它们解决了以下问题：
+
+- 编译器重排序：编译器优化可能改变指令顺序
+- CPU重排序：处理器可能乱序执行内存访问
+- 缓存一致性：多核系统中的缓存同步延迟
+
+#### 3.4.2 Linux内存屏障API
+
+Linux内核提供了一组内存屏障原语：
+
+```c
+/* 通用内存屏障 */
+void mb(void);      /* 完全内存屏障 */
+void rmb(void);     /* 读内存屏障 */
+void wmb(void);     /* 写内存屏障 */
+
+/* 带获取/释放语义的屏障 */
+void smp_mb(void);  /* SMP完全内存屏障 */
+void smp_rmb(void); /* SMP读内存屏障 */
+void smp_wmb(void); /* SMP写内存屏障 */
+
+/* 编译器屏障 */
+void barrier(void); /* 防止编译器重排序 */
+```
+
+#### 3.4.3 内存屏障使用场景
+
+内存屏障在以下场景中至关重要：
+
+1. **锁实现**：
+   ```c
+   /* 自旋锁实现示例 */
+   void spin_lock(spinlock_t *lock)
+   {
+       /* 尝试获取锁 */
+       while (test_and_set_bit_lock(0, &lock->slock)) {
+           /* 等待 */
+       }
+
+       /* 获取锁后的内存屏障 */
+       smp_mb__after_spinlock();
+   }
+   ```
+
+2. **无锁数据结构**：
+   ```c
+   /* 无锁队列示例 */
+   void queue_push(struct queue *q, struct node *n)
+   {
+       n->next = NULL;
+       struct node *prev = xchg(&q->tail, n);
+
+       /* 确保节点完全初始化后再链接 */
+       smp_wmb();
+
+       prev->next = n;
+   }
+   ```
+
 1. **批量TLB Flush**
    - 收集多个TLB失效请求，一次性处理
    - 减少TLB刷新频率
@@ -501,42 +868,73 @@ TLB Shootdown是多处理器系统中维护TLB一致性的关键机制。当一�
 
 1. **MMU Notifier机制**
    ```c
+   /*
+    * MMU Notifier机制的核心函数，用于通知所有注册的监听器页表即将发生变化
+    * @mm: 进程的内存描述符，包含了进程的地址空间信息
+    * @start: 需要失效的虚拟地址范围的起始地址
+    * @end: 需要失效的虚拟地址范围的结束地址
+    *
+    * 该函数主要用于以下场景：
+    * 1. 虚拟化环境中，当Guest OS修改页表时，通知Hypervisor
+    * 2. 设备驱动程序需要维护自己的地址转换表时
+    * 3. 其他需要跟踪页表变化的子系统
+    */
    static void __mmu_notifier_invalidate_range_start(struct mm_struct *mm,
            unsigned long start, unsigned long end)
    {
-       // 通知所有注册的侦听器页表变化
        struct mmu_notifier *mn;
 
+       /* 使用RCU机制遍历所有注册的notifier
+        * 这里使用RCU是为了在遍历列表时允许并发的注册新的notifier
+        */
        hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist)
            if (mn->ops->invalidate_range_start)
+               /* 调用每个notifier注册的回调函数 */
                mn->ops->invalidate_range_start(mn, mm, start, end);
    }
    ```
 
 2. **IPI处理流程**
    ```c
+   /*
+    * 在多处理器系统中刷新其他CPU的TLB
+    * @cpumask: 需要执行TLB刷新的CPU掩码
+    * @mm: 需要刷新TLB的进程内存描述符
+    * @start: 需要刷新的虚拟地址范围起始地址
+    * @end: 需要刷新的虚拟地址范围结束地址
+    *
+    * 该函数通过处理器间中断(IPI)实现跨CPU的TLB同步
+    * 这是保持多CPU系统TLB一致性的关键机制
+    */
    static void native_flush_tlb_others(const struct cpumask *cpumask,
            struct mm_struct *mm, unsigned long start, unsigned long end)
    {
-       // 发送IPI到其他CPU
+       /* 准备TLB刷新信息 */
        struct tlb_flush_info info;
-       info.mm = mm;
-       info.start = start;
-       info.end = end;
+       info.mm = mm;      /* 要刷新的地址空间 */
+       info.start = start;  /* 刷新范围的起始地址 */
+       info.end = end;      /* 刷新范围的结束地址 */
        
-       // 在目标CPU上执行TLB flush
+       /* 通过IPI触发其他CPU执行TLB刷新
+        * 最后的参数1表示等待所有CPU完成刷新操作
+        */
        smp_call_function_many(cpumask, flush_tlb_func, &info, 1);
    }
    ```
 
 3. **延迟TLB Flush优化**
    ```c
+   /*
+    * TLB批处理结构体，用于优化TLB刷新操作
+    * 通过将多个TLB刷新请求合并处理，减少IPI中断次数
+    * 这对于大量小粒度的TLB刷新操作特别有效
+    */
    struct tlb_batch {
-       struct mm_struct *mm;
-       unsigned long start;
-       unsigned long end;
-       unsigned int nr;        // 批处理的页面数
-       bool flush_needed;      // 是否需要刷新
+       struct mm_struct *mm;    /* 地址空间描述符 */
+       unsigned long start;     /* 批处理范围的最小地址 */
+       unsigned long end;       /* 批处理范围的最大地址 */
+       unsigned int nr;        /* 当前批次中累积的页面数量 */
+       bool flush_needed;      /* 标记是否需要执行实际的刷新操作 */
    };
 
    // 批量处理TLB flush请求

@@ -10,19 +10,21 @@ ARM64架构在启动阶段的内存管理有其特殊性，主要包括以下几
 #### 2.1.1 早期初始化
 
 1. **CPU初始化**
-   ```c
-   void __init arm64_init_mmu(void)
-   {
-       // 配置MAIR_EL1内存属性
-       write_sysreg(MAIR_VALUE, mair_el1);
-       
-       // 配置TCR_EL1转换控制
-       write_sysreg(TCR_VALUE, tcr_el1);
-       
-       // 设置TTBR0_EL1和TTBR1_EL1
-       write_sysreg(TTBR0_VALUE, ttbr0_el1);
-       write_sysreg(TTBR1_VALUE, ttbr1_el1);
-   }
+   ```s
+   SYM_FUNC_START(__enable_mmu)
+	mrs	x3, ID_AA64MMFR0_EL1
+	ubfx	x3, x3, #ID_AA64MMFR0_EL1_TGRAN_SHIFT, 4
+	cmp     x3, #ID_AA64MMFR0_EL1_TGRAN_SUPPORTED_MIN
+	b.lt    __no_granule_support
+	cmp     x3, #ID_AA64MMFR0_EL1_TGRAN_SUPPORTED_MAX
+	b.gt    __no_granule_support
+	phys_to_ttbr x2, x2
+	msr	ttbr0_el1, x2			// load TTBR0
+	load_ttbr1 x1, x1, x3
+
+	set_sctlr_el1	x0
+
+	ret
    ```
 
 2. **设备树解析**
@@ -42,21 +44,107 @@ ARM64架构在启动阶段的内存管理有其特殊性，主要包括以下几
 
 1. **初始页表设置**
    ```c
-   void __init paging_init(void)
-   {
-       // 设置初始页表
-       map_kernel();
-       map_mem();
-       
-       // 初始化内存管理区域
-       zone_sizes_init();
-   }
+    void __init paging_init(void)
+    {
+        map_mem(swapper_pg_dir);
+
+        memblock_allow_resize();
+
+        create_idmap();
+        declare_kernel_vmas();
+    }
    ```
 
 2. **内存属性配置**
-   - 设备内存：nGnRnE、nGnRE、GRE等
-   - 正常内存：缓存策略、共享属性
-   - 访问权限：EL0/EL1权限控制
+
+   ARM64架构通过MAIR_ELx寄存器和页表描述符配置内存属性，主要包括以下几个方面：
+
+   a) **设备内存类型**
+      - Device-nGnRnE（非收集、非重排序、非提前）
+        ```c
+        #define MT_DEVICE_nGnRnE    0
+        // 用于不支持任何重排序的设备
+        // 典型应用：中断控制器、定时器等
+        ```
+      - Device-nGnRE（非收集、非重排序、允许提前）
+        ```c
+        #define MT_DEVICE_nGnRE     1
+        // 允许读操作重排序
+        // 典型应用：某些外设寄存器
+        ```
+      - Device-nGRE（非收集、允许重排序、允许提前）
+        ```c
+        #define MT_DEVICE_GRE       2
+        // 允许更多重排序优化
+        // 典型应用：DMA设备
+        ```
+      - Device-GRE（允许收集、允许重排序、允许提前）
+        ```c
+        // 最宽松的设备访问策略
+        // 典型应用：高性能外设
+        ```
+
+   b) **正常内存属性**
+      - 缓存策略配置
+        ```c
+        #define MT_NORMAL_NC        3  // 非缓存
+        #define MT_NORMAL           4  // 可缓存
+
+        // MAIR寄存器配置示例
+        #define MAIR_NORMAL_NC      ((0x44 << 8) | 0x44)  // 非缓存
+        #define MAIR_NORMAL_WT      ((0xBB << 8) | 0xBB)  // 写穿式缓存
+        #define MAIR_NORMAL_WB      ((0xFF << 8) | 0xFF)  // 回写式缓存
+        ```
+
+      - 共享属性设置
+        ```c
+        // 页表描述符中的共享位
+        #define PTE_SHARED          (3 << 8)   // 内部共享
+        #define PTE_NON_SHARED      (0 << 8)   // 非共享
+        #define PTE_OUTER_SHARED    (2 << 8)   // 外部共享
+        ```
+
+   c) **访问权限控制**
+      - EL0（用户空间）权限
+        ```c
+        // 页表描述符中的访问权限位
+        #define PTE_USER            (1 << 6)   // EL0可访问
+        #define PTE_RDONLY          (1 << 7)   // 只读权限
+        ```
+
+      - EL1（内核空间）权限
+        ```c
+        // 内核空间访问控制
+        #define PTE_KERNEL          (0 << 6)   // 仅EL1可访问
+        #define PTE_RDWR            (0 << 7)   // 读写权限
+        ```
+
+      - 权限组合示例
+        ```c
+        // 用户空间只读页
+        #define PTE_USER_RO         (PTE_USER | PTE_RDONLY)
+        // 内核空间读写页
+        #define PTE_KERNEL_RW       (PTE_KERNEL | PTE_RDWR)
+        ```
+
+   d) **内存属性应用场景**
+      ```c
+      // 设备映射示例
+      static struct map_desc uart_map __initdata = {
+          .virtual = UART_VIRT_BASE,
+          .pfn = __phys_to_pfn(UART_PHYS_BASE),
+          .length = SZ_4K,
+          .type = MT_DEVICE_nGnRnE  // 串口设备使用非缓存属性
+      };
+
+      // 普通内存映射示例
+      static struct map_desc dram_map __initdata = {
+          .virtual = DRAM_VIRT_BASE,
+          .pfn = __phys_to_pfn(DRAM_PHYS_BASE),
+          .length = DRAM_SIZE,
+          .type = MT_NORMAL         // 主存使用可缓存属性
+      };
+      ```
 
 #### 2.1.3 EL级别内存管理
 
